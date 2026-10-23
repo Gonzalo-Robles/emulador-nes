@@ -1,0 +1,212 @@
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NES HD</title>
+<style>
+:root{--bg:#f2f2ef;--fg:#1c1c1c;--card:#fff;--ac:#c8321e;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121212;--fg:#ececec;--card:#1f1f1f}}
+:root[data-theme="dark"]{--bg:#121212;--fg:#ececec;--card:#1f1f1f}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px -apple-system,system-ui,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;gap:12px;padding:14px}
+#w{position:relative;width:min(96vw,calc(80vh*256/240));aspect-ratio:256/240;background:#000;border-radius:8px;overflow:hidden}
+canvas{width:100%;height:100%;display:block}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:#fff;padding:20px;font-size:16px;line-height:1.5}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;background:var(--card);padding:10px 14px;border-radius:10px}
+button,select,label.b{font:inherit;color:var(--fg);background:var(--bg);border:1px solid #8886;border-radius:8px;padding:6px 12px;cursor:pointer}
+label.b{background:var(--ac);color:#fff;border-color:var(--ac)}
+small{opacity:.7;text-align:center;max-width:720px}
+</style></head><body>
+<div id="w"><canvas id="c"></canvas><div id="msg">Elegí tu archivo .nes (o el .zip) o arrastralo acá.<br>Funciona con juegos de mapper 0 y 4 (Super Mario Bros. 3 incluido).</div></div>
+<div class="bar">
+<label class="b">Cargar ROM<input id="f" type="file" accept=".nes,.zip" hidden></label>
+<select id="m"><option value="2">Filtro: CRT</option><option value="1">Filtro: Suavizado nítido</option><option value="0">Filtro: Píxel crudo</option></select>
+<label><input id="u" type="checkbox" checked> Sin parpadeo de sprites</label>
+<button id="fs">Pantalla completa</button>
+</div>
+<small>Controles: flechas = cruceta · Z = B · X = A · Enter = Start · Shift = Select. El emulador corre local en tu navegador (nativo en Apple Silicon); el ROM no se sube a ningún lado. Esta versión no tiene sonido todavía.</small>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+/* ---------- estado ---------- */
+let prg,chr,chrRam=false,mp=0,mir=0,prgRam=new Uint8Array(8192),ram=new Uint8Array(2048),nt=new Uint8Array(2048),pal=new Uint8Array(32),oam=new Uint8Array(256);
+let A=0,X=0,Y=0,S=0xfd,P=0x24,pc=0,cyc=0,tot=0,nmi=0,pad=0,sh=0,unl=1;
+let bsel=0,br=[0,2,4,5,6,7,0,1],pb=[0,0,0,0],cb=[0,1,2,3,4,5,6,7],iLat=0,iCnt=0,iRel=0,iEn=0,iFlag=0;
+let ctrl=0,mask=0,status=0,oa=0,v=0,t=0,fX=0,w=0,rbuf=0;
+const px=new Uint32Array(256*240),px8=new Uint8Array(px.buffer);
+const RGB=[0x626262,0x001FB2,0x2404C8,0x5200B2,0x730076,0x800024,0x730B00,0x522800,0x244400,0x005700,0x005C00,0x005324,0x003C76,0,0,0,
+0xABABAB,0x0D57FF,0x4B30FF,0x8A13FF,0xBC08D6,0xD21269,0xC72E00,0x9D5400,0x607B00,0x209800,0x00A300,0x009942,0x007DB4,0,0,0,
+0xFFFFFF,0x53AEFF,0x9085FF,0xD365FF,0xFF57FF,0xFF5DCF,0xFF7757,0xFA9E00,0xBDC700,0x7AE700,0x43F611,0x26EF7E,0x2CD5F6,0x4E4E4E,0,0,
+0xFFFFFF,0xB6E1FF,0xCED1FF,0xE9C3FF,0xFFBCFF,0xFFBDF4,0xFFC6C3,0xFFD59A,0xE9E681,0xCEF481,0xB6FB9A,0xA9FAC3,0xA9F0F4,0xB8B8B8,0,0];
+const NC=RGB.map(c=>(255<<24)|((c&255)<<16)|(c&0xff00)|(c>>16));
+/* ---------- mapper ---------- */
+function sync(){const n=prg.length>>13;
+ if(mp==0){pb=n>2?[0,1,2,3]:[0,1,0,1];cb=[0,1,2,3,4,5,6,7];return}
+ const pm=bsel&64;pb=[pm?n-2:br[6],br[7],pm?br[6]:n-2,n-1];
+ const r=[br[0]&254,br[0]|1,br[1]&254,br[1]|1,br[2],br[3],br[4],br[5]];
+ cb=bsel&128?[r[4],r[5],r[6],r[7],r[0],r[1],r[2],r[3]]:r}
+function mm(a,val){switch(a&0xe001){
+ case 0x8000:bsel=val;sync();break;case 0x8001:br[bsel&7]=val;sync();break;
+ case 0xa000:mir=val&1;break;case 0xc000:iLat=val;break;case 0xc001:iCnt=0;iRel=1;break;
+ case 0xe000:iEn=0;iFlag=0;break;case 0xe001:iEn=1}}
+function clkIrq(){if(iCnt==0||iRel){iCnt=iLat;iRel=0}else iCnt--;if(iCnt==0&&iEn)iFlag=1}
+/* ---------- PPU ---------- */
+const chrR=a=>{a&=0x1fff;return chr[((cb[a>>10]<<10)|(a&1023))%chr.length]};
+const ntI=a=>((mir?[0,0,1,1]:[0,1,0,1])[a>>10&3]<<10)|(a&1023);
+function ppuRead(a){a&=0x3fff;if(a<0x2000)return chrR(a);if(a<0x3f00)return nt[ntI(a)];let i=a&31;if((i&19)==16)i&=15;return pal[i]}
+function ppuWrite(a,val){a&=0x3fff;if(a<0x2000){if(chrRam)chr[a]=val}else if(a<0x3f00)nt[ntI(a)]=val;else{let i=a&31;if((i&19)==16)i&=15;pal[i]=val&63}}
+function pr(r){let o;switch(r){
+ case 2:o=status;status&=~0x80;w=0;return o;
+ case 4:return oam[oa];
+ case 7:if((v&0x3fff)>=0x3f00)o=ppuRead(v);else{o=rbuf;}rbuf=ppuRead((v&0x3fff)>=0x3f00?v-0x1000:v);v=v+(ctrl&4?32:1)&0x7fff;return o}
+ return 0}
+function pw(r,val){switch(r){
+ case 0:if(!(ctrl&128)&&val&128&&status&128)nmi=1;ctrl=val;t=t&~0xc00|(val&3)<<10;break;
+ case 1:mask=val;break;case 3:oa=val;break;case 4:oam[oa]=val;oa=oa+1&255;break;
+ case 5:if(!w){t=t&~31|val>>3;fX=val&7}else t=t&~0x73e0|(val&7)<<12|(val&0xf8)<<2;w^=1;break;
+ case 6:if(!w)t=t&0xff|(val&0x3f)<<8;else{t=t&0xff00|val;v=t}w^=1;break;
+ case 7:ppuWrite(v,val);v=v+(ctrl&4?32:1)&0x7fff}}
+const bgI=new Uint8Array(256),spI=new Uint8Array(256),spP=new Uint8Array(256);
+function render(y){
+ const bgOn=mask&8,spOn=mask&16,o=y*256;
+ if(!(bgOn||spOn)){const c=NC[pal[0]];for(let x=0;x<256;x++)px[o+x]=c;return}
+ bgI.fill(0);spI.fill(0);
+ if(bgOn){let lv=v;const base=(ctrl&16)<<8,fy=lv>>12&7;
+  for(let tx=0;tx<33;tx++){
+   const id=ppuRead(0x2000|lv&0xfff),at=ppuRead(0x23c0|lv&0xc00|lv>>4&0x38|lv>>2&7),
+   pl=at>>((lv>>4&4)|(lv&2))&3,ad=base+id*16+fy,lo=ppuRead(ad),hi=ppuRead(ad+8);
+   for(let i=0;i<8;i++){const x=tx*8+i-fX;if(x<0||x>255||(x<8&&!(mask&2)))continue;
+    const c=(lo>>(7-i)&1)|(hi>>(7-i)&1)<<1;bgI[x]=c?c|pl<<2:0}
+   if((lv&31)==31){lv&=~31;lv^=0x400}else lv++}}
+ if(spOn){const h=ctrl&32?16:8,sb=(ctrl&8)<<9,L=[];
+  for(let i=0;i<64;i++){const r=y-oam[i*4]-1;if(r>=0&&r<h)L.push(i)}
+  if(L.length>8&&!unl)L.length=8;else if(L.length>8&&unl){status|=0}
+  for(let k=L.length-1;k>=0;k--){const i=L[k],tl=oam[i*4+1],at=oam[i*4+2],sx=oam[i*4+3];let r=y-oam[i*4]-1;if(at&128)r=h-1-r;
+   const ad=h==16?((tl&1)<<12)+(((tl&254)+(r>>3))<<4)+(r&7):sb+tl*16+r,lo=ppuRead(ad),hi=ppuRead(ad+8);
+   for(let j=0;j<8;j++){const b=at&64?j:7-j,c=(lo>>b&1)|(hi>>b&1)<<1,x=sx+j;
+    if(!c||x>255||(x<8&&!(mask&4)))continue;
+    if(i==0&&bgI[x]&&x<255&&bgOn)status|=0x40;
+    spI[x]=16+((at&3)<<2)+c;spP[x]=at>>5&1}}}
+ for(let x=0;x<256;x++){const b=bgI[x],s=spI[x];px[o+x]=NC[pal[s&&(!b||!spP[x])?s:b]]}
+ if((v&0x7000)!=0x7000)v+=0x1000;else{v&=~0x7000;let yy=(v&0x3e0)>>5;if(yy==29){yy=0;v^=0x800}else if(yy==31)yy=0;else yy++;v=v&~0x3e0|yy<<5}
+ v=v&~0x41f|t&0x41f}
+/* ---------- bus ---------- */
+function rd(a){a&=65535;if(a<0x2000)return ram[a&2047];if(a<0x4000)return pr(a&7);
+ if(a==0x4016){const r=sh&1;sh=sh>>1|128;return r|0x40}
+ if(a>=0x8000)return prg[(pb[a>>13&3]%(prg.length>>13)<<13)|(a&0x1fff)];
+ if(a>=0x6000)return prgRam[a&0x1fff];return 0}
+function wr(a,val){a&=65535;val&=255;
+ if(a<0x2000)ram[a&2047]=val;else if(a<0x4000)pw(a&7,val);
+ else if(a==0x4014){const b=val<<8;for(let i=0;i<256;i++)oam[oa+i&255]=rd(b+i);cyc+=513}
+ else if(a==0x4016){if(val&1)sh=pad}
+ else if(a>=0x8000){if(mp==4)mm(a,val)}else if(a>=0x6000)prgRam[a&0x1fff]=val}
+/* ---------- CPU 6502 ---------- */
+const nz=r=>{P=P&0x7d|r&128|(r?0:2);return r};
+const push=r=>{ram[0x100|S]=r;S=S-1&255},pull=()=>{S=S+1&255;return ram[0x100|S]};
+function intr(vec,b){push(pc>>8&255);push(pc&255);push(P&~16|32|b);P|=4;pc=rd(vec)|rd(vec+1)<<8;cyc+=7}
+function adc(m){const r=A+m+(P&1);P=P&0xbe|(r>255?1:0)|(~(A^m)&(A^r)&0x80?64:0);A=nz(r&255)}
+function cmp(r,m){const d=r-m&255;P=P&0x7c|(r>=m?1:0)|(r==m?2:0)|d&128}
+function ea(m){let a;switch(m){
+ case 0:return pc++;case 1:return rd(pc++);case 2:return rd(pc++)+X&255;case 8:return rd(pc++)+Y&255;
+ case 3:a=rd(pc)|rd(pc+1)<<8;pc+=2;return a;
+ case 4:a=rd(pc)|rd(pc+1)<<8;pc+=2;cyc+=(a&255)+X>255?1:0;return a+X&65535;
+ case 5:a=rd(pc)|rd(pc+1)<<8;pc+=2;cyc+=(a&255)+Y>255?1:0;return a+Y&65535;
+ case 6:a=rd(pc++)+X&255;return rd(a)|rd(a+1&255)<<8;
+ case 7:a=rd(pc++);a=rd(a)|rd(a+1&255)<<8;cyc+=(a&255)+Y>255?1:0;return a+Y&65535}}
+const XC=[0,1,2,2,2,2,4,3,2];
+function rmw(a,val){let r;switch(a){
+ case 0:r=val<<1&255;P=P&~1|val>>7;break;case 1:r=(val<<1|P&1)&255;P=P&~1|val>>7;break;
+ case 2:r=val>>1;P=P&~1|val&1;break;case 3:r=val>>1|(P&1)<<7;P=P&~1|val&1;break;
+ case 6:r=val-1&255;break;default:r=val+1&255}return nz(r)}
+function grp(op){const a=op>>5,b=op>>2&7,c=op&3;let m,ad,val;
+ if(c==1){m=[6,1,0,3,7,2,5,4][b];ad=ea(m);cyc+=2+XC[m];
+  if(a==4){if(m>3&&m!=6)cyc++;wr(ad,A);return}
+  val=rd(ad);switch(a){case 0:A=nz(A|val);break;case 1:A=nz(A&val);break;case 2:A=nz(A^val);break;
+   case 3:adc(val);break;case 5:A=nz(val);break;case 6:cmp(A,val);break;case 7:adc(val^255)}return}
+ if(c==2){if(b==2){A=rmw(a,A);cyc+=2;return}
+  m=[0,1,0,3,0,(a==4||a==5)?8:2,0,a==5?5:4][b];ad=ea(m);cyc+=2+XC[m];
+  if(a==4){wr(ad,X);return}if(a==5){X=nz(rd(ad));return}
+  val=rd(ad);wr(ad,rmw(a,val));cyc+=2;return}
+ if(c==0){m=[0,1,0,3,0,2,0,4][b];ad=ea(m);cyc+=2+XC[m];
+  switch(a){case 1:val=rd(ad);P=P&0x3d|val&0xc0|(A&val?0:2);break;case 4:wr(ad,Y);break;
+   case 5:Y=nz(rd(ad));break;case 6:cmp(Y,rd(ad));break;case 7:cmp(X,rd(ad))}return}
+ cyc+=2}
+function step(){
+ if(nmi){nmi=0;return intr(0xfffa,0)}
+ if(iFlag&&!(P&4))return intr(0xfffe,0);
+ const op=rd(pc++);let tt;
+ if((op&31)==16){const f=[128,64,1,2][op>>6],a=op>>5&1;let o=rd(pc++);o=o<<24>>24;cyc+=2;
+  if((P&f?1:0)==a){cyc++;tt=pc+o;cyc+=((tt^pc)&0xff00)?1:0;pc=tt&65535}return}
+ switch(op){
+ case 0x00:pc++;return intr(0xfffe,16);
+ case 0x20:tt=pc+1;push(tt>>8&255);push(tt&255);pc=rd(pc)|rd(pc+1)<<8;cyc+=6;return;
+ case 0x40:P=pull()&~16|32;pc=pull();pc|=pull()<<8;cyc+=6;return;
+ case 0x60:pc=pull();pc|=pull()<<8;pc++;cyc+=6;return;
+ case 0x08:push(P|48);cyc+=3;return;
+ case 0x28:P=pull()&~16|32;cyc+=4;return;
+ case 0x48:push(A);cyc+=3;return;
+ case 0x68:A=nz(pull());cyc+=4;return;
+ case 0x4c:pc=rd(pc)|rd(pc+1)<<8;cyc+=3;return;
+ case 0x6c:tt=rd(pc)|rd(pc+1)<<8;pc=rd(tt)|rd(tt&0xff00|tt+1&255)<<8;cyc+=5;return;
+ case 0x88:Y=nz(Y-1&255);break;case 0xa8:Y=nz(A);Y=A;break;case 0xc8:Y=nz(Y+1&255);break;case 0xe8:X=nz(X+1&255);break;
+ case 0x18:P&=~1;break;case 0x38:P|=1;break;case 0x58:P&=~4;break;case 0x78:P|=4;break;
+ case 0x98:A=nz(Y);break;case 0xb8:P&=~64;break;case 0xd8:P&=~8;break;case 0xf8:P|=8;break;
+ case 0x8a:A=nz(X);break;case 0x9a:S=X;break;case 0xaa:X=nz(A);break;case 0xba:X=nz(S);break;
+ case 0xca:X=nz(X-1&255);break;case 0xea:break;
+ default:return grp(op)}
+ cyc+=2}
+/* ---------- frame ---------- */
+function frame(){
+ for(let y=0;y<262;y++){
+  const rend=mask&24;
+  if(y<240)render(y);
+  if(y==241){status|=0x80;if(ctrl&128)nmi=1}
+  if(y==261){status&=0x1f;if(rend)v=v&~0x7be0|t&0x7be0}
+  if((y<240||y==261)&&rend)clkIrq();
+  tot+=113.667;while(cyc<tot)step()}
+ tot-=cyc;cyc=0;tot=Math.max(tot,0)}
+/* ---------- carga ---------- */
+async function getNes(b){const d=new DataView(b);
+ if(d.getUint32(0,true)==0x04034b50){const m=d.getUint16(8,true),n=d.getUint16(26,true),e=d.getUint16(28,true),s=30+n+e,cs=d.getUint32(18,true);
+  const data=b.slice(s,cs?s+cs:undefined);if(m==0)return data;
+  const ds=new DecompressionStream("deflate-raw"),wt=ds.writable.getWriter();wt.write(new Uint8Array(data));wt.close();
+  return await new Response(ds.readable).arrayBuffer()}
+ return b}
+function boot(buf){const d=new Uint8Array(buf);
+ if(d[0]!=78||d[1]!=69||d[2]!=83)throw new Error("No es un archivo .nes válido");
+ mp=(d[7]&0xf0)|(d[6]>>4);if(mp!=0&&mp!=4)throw new Error("Mapper "+mp+" no soportado (solo 0 y 4)");
+ let o=16+(d[6]&4?512:0);prg=d.slice(o,o+d[4]*16384);o+=d[4]*16384;
+ if(d[5]){chr=d.slice(o,o+d[5]*8192);chrRam=false}else{chr=new Uint8Array(8192);chrRam=true}
+ mir=(d[6]&1)^1;ram.fill(0);nt.fill(0);pal.fill(0);oam.fill(0);br=[0,2,4,5,6,7,0,1];bsel=0;iFlag=iEn=iCnt=0;
+ ctrl=mask=status=v=t=w=0;A=X=Y=0;S=0xfd;P=0x34;cyc=tot=0;nmi=0;sync();pc=rd(0xfffc)|rd(0xfffd)<<8;run=true;$("#msg").style.display="none"}
+async function loadFile(f){try{boot(await getNes(await f.arrayBuffer()))}catch(e){const m=$("#msg");m.style.display="flex";m.textContent="Error: "+e.message+" (si es un zip, probá descomprimirlo primero)"}}
+/* ---------- WebGL ---------- */
+const cv=$("#c"),gl=cv.getContext("webgl");let run=false;
+const vsS="attribute vec2 a;varying vec2 u;void main(){u=a*.5+.5;u.y=1.-u.y;gl_Position=vec4(a,0,1);}";
+const fsS="precision highp float;uniform sampler2D t;uniform vec2 r;uniform float m;varying vec2 u;"+
+"void main(){vec2 p=u*vec2(256.,240.),f=fract(p);vec3 c;float S=max(r.x/256.,1.);"+
+"if(m<.5)c=texture2D(t,(floor(p)+.5)/vec2(256.,240.)).rgb;else{f=clamp((f-.5)*S+.5,0.,1.);c=texture2D(t,(floor(p)+f)/vec2(256.,240.)).rgb;}"+
+"if(m>1.5){float d=abs(fract(p.y)-.5)*2.;c*=1.-.45*d*d;c*=1.-.12*step(1.5,mod(gl_FragCoord.x,3.));vec2 q=u-.5;c*=1.-1.3*dot(q,q);c=pow(c,vec3(.9))*1.12;}"+
+"gl_FragColor=vec4(c,1.);}";
+function sh_(ty,s){const o=gl.createShader(ty);gl.shaderSource(o,s);gl.compileShader(o);return o}
+const pg=gl.createProgram();gl.attachShader(pg,sh_(gl.VERTEX_SHADER,vsS));gl.attachShader(pg,sh_(gl.FRAGMENT_SHADER,fsS));gl.linkProgram(pg);gl.useProgram(pg);
+const bf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,bf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+const al=gl.getAttribLocation(pg,"a");gl.enableVertexAttribArray(al);gl.vertexAttribPointer(al,2,gl.FLOAT,false,0,0);
+const tx=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tx);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,256,240,0,gl.RGBA,gl.UNSIGNED_BYTE,px8);
+const uR=gl.getUniformLocation(pg,"r"),uM=gl.getUniformLocation(pg,"m");
+function fit(){const d=window.devicePixelRatio||1;cv.width=Math.round(cv.clientWidth*d);cv.height=Math.round(cv.clientHeight*d);gl.viewport(0,0,cv.width,cv.height)}
+function draw(){gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,256,240,gl.RGBA,gl.UNSIGNED_BYTE,px8);
+ gl.uniform2f(uR,cv.width,cv.height);gl.uniform1f(uM,+$("#m").value);gl.drawArrays(gl.TRIANGLE_STRIP,0,4)}
+addEventListener("resize",fit);fit();draw();
+/* ---------- bucle y entrada ---------- */
+let last=0;function loop(ts){requestAnimationFrame(loop);if(!run||ts-last<16.2)return;last=ts;frame();draw()}requestAnimationFrame(loop);
+const KM={ArrowRight:128,ArrowLeft:64,ArrowDown:32,ArrowUp:16,Enter:8,ShiftLeft:4,ShiftRight:4,KeyZ:2,KeyX:1};
+addEventListener("keydown",e=>{if(KM[e.code]){pad|=KM[e.code];e.preventDefault()}});
+addEventListener("keyup",e=>{if(KM[e.code]){pad&=~KM[e.code];e.preventDefault()}});
+$("#f").onchange=e=>e.target.files[0]&&loadFile(e.target.files[0]);
+addEventListener("dragover",e=>e.preventDefault());
+addEventListener("drop",e=>{e.preventDefault();e.dataTransfer.files[0]&&loadFile(e.dataTransfer.files[0])});
+$("#u").onchange=e=>unl=e.target.checked?1:0;
+$("#fs").onclick=()=>$("#w").requestFullscreen&&$("#w").requestFullscreen().then(fit);
+</script></body></html>
